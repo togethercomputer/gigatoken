@@ -1,6 +1,7 @@
 use crate::bpe::pretoken_cache::ShortPretokenCache;
 use crate::bpe::{
-    ByteRemapping, MergeScratch, PairRankTable, SHORT_MERGE_MAX, bpe_merge_symbols_by_rank,
+    ByteRemapping, MergeScratch, MissingBytePolicy, PairRankTable, SHORT_MERGE_MAX,
+    bpe_merge_symbols_by_rank,
     bpe_merge_symbols_ranked, bpe_merge_symbols_ranked_slice, bpe_merge_symbols_short_scalar,
     bpe_merge_symbols_with_scratch, simple_bpe_merge,
 };
@@ -616,20 +617,8 @@ impl Tokenizer {
                 return 1;
             }
         }
-        let n = bytes.len();
-        debug_assert!((1..SHORT_MERGE_MAX).contains(&n));
-        match byte_remapping {
-            Some(br) => {
-                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
-                    *dst = br.mapping[b as usize];
-                }
-            }
-            None => {
-                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
-                    *dst = TokenId(b as u32);
-                }
-            }
-        }
+        debug_assert!((1..SHORT_MERGE_MAX).contains(&bytes.len()));
+        let n = ByteRemapping::remap_short_any(byte_remapping, bytes, buf);
         if n < 2 {
             return n;
         }
@@ -649,20 +638,8 @@ impl Tokenizer {
         bytes: &[u8],
         buf: &mut [TokenId; SHORT_MERGE_MAX],
     ) -> usize {
-        let n = bytes.len();
-        debug_assert!((1..SHORT_MERGE_MAX).contains(&n));
-        match byte_remapping {
-            Some(br) => {
-                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
-                    *dst = br.mapping[b as usize];
-                }
-            }
-            None => {
-                for (dst, &b) in buf[..n].iter_mut().zip(bytes) {
-                    *dst = TokenId(b as u32);
-                }
-            }
-        }
+        debug_assert!((1..SHORT_MERGE_MAX).contains(&bytes.len()));
+        let n = ByteRemapping::remap_short_any(byte_remapping, bytes, buf);
         if n < 2 {
             return n;
         }
@@ -734,7 +711,7 @@ impl Tokenizer {
             merges.insert((tokenized[0], tokenized[1]), TokenId::from(token_idx));
         }
 
-        let byte_remapping = ByteRemapping::from_byte_vocab(&vocab)?;
+        let byte_remapping = ByteRemapping::from_byte_vocab(&vocab, MissingBytePolicy::Error)?;
         Ok(Self::from_tables(merges, None, vocab, byte_remapping))
     }
 
@@ -1555,10 +1532,7 @@ impl Tokenizer {
             {
                 symbols.push(id);
             } else {
-                match self.byte_remapping.as_ref() {
-                    Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
-                    None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
-                }
+                ByteRemapping::remap_extend_any(self.byte_remapping.as_ref(), bytes, symbols);
                 bpe_merge_symbols_ranked(&rm, symbols);
             }
             let len = symbols.len() as u32;
@@ -1664,10 +1638,7 @@ impl Tokenizer {
             {
                 symbols.push(id);
             } else {
-                match self.byte_remapping.as_ref() {
-                    Some(br) => symbols.extend(bytes.iter().map(|&b| br.mapping[b as usize])),
-                    None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
-                }
+                ByteRemapping::remap_extend_any(self.byte_remapping.as_ref(), bytes, symbols);
                 match self.pair_ranks.as_deref() {
                     Some(table) => bpe_merge_symbols_by_rank(
                         &|a, b| table.rank(a, b),
@@ -1740,10 +1711,8 @@ mod test_util {
     /// loop over the merges HashMap (no pair-rank table, no cache, no
     /// short-merge kernels).
     pub(super) fn plain_encode_pretoken(tok: &Tokenizer, pretoken: &[u8], out: &mut Vec<u32>) {
-        let mut symbols: Vec<TokenId> = match tok.byte_remapping.as_ref() {
-            Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
-            None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
-        };
+        let mut symbols: Vec<TokenId> = Vec::new();
+        ByteRemapping::remap_extend_any(tok.byte_remapping.as_ref(), pretoken, &mut symbols);
         crate::bpe::bpe_merge_symbols(&tok.merges, &mut symbols);
         out.extend(symbols.iter().map(|t| t.0));
     }
@@ -2672,10 +2641,8 @@ mod verify_heavy {
 
         // Uncached reference: remap bytes and run the plain merge loop.
         let encode_reference = |pretoken: Pretoken| -> Vec<TokenId> {
-            let mut symbols: Vec<TokenId> = match tokenizer.byte_remapping.as_ref() {
-                Some(br) => pretoken.iter().map(|&b| br.mapping[b as usize]).collect(),
-                None => pretoken.iter().map(|&b| TokenId::from(b as u32)).collect(),
-            };
+            let mut symbols: Vec<TokenId> = Vec::new();
+            ByteRemapping::remap_extend_any(tokenizer.byte_remapping.as_ref(), pretoken.0, &mut symbols);
             crate::bpe::bpe_merge_symbols(&tokenizer.merges, &mut symbols);
             symbols
         };

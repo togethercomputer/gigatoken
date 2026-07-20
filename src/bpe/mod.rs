@@ -46,8 +46,28 @@ use std::collections::HashMap;
 pub struct ByteRemapping {
     /// Maps each byte value to the token ID of its single-byte vocab entry.
     /// The IDs need not be < 256 (e.g. DeepSeek puts its byte tokens at
-    /// 3..=258, after the special tokens).
+    /// 3..=258, after the special tokens). Under [`MissingBytePolicy::Drop`],
+    /// bytes with no vocab entry hold [`Self::DROPPED`] instead.
     mapping: Vec<TokenId>,
+    /// True when any `mapping` entry is [`Self::DROPPED`]; the remap loops
+    /// branch to a compacting variant only in that case, so complete vocabs
+    /// keep the straight-line loop.
+    has_drops: bool,
+}
+
+/// What [`ByteRemapping::from_byte_vocab`] does about a byte value that can
+/// appear in valid UTF-8 but has no single-byte vocab entry.
+#[derive(Clone, Copy)]
+pub enum MissingBytePolicy {
+    /// Refuse to build the table (tiktoken-style vocabs, where every byte
+    /// must be representable).
+    Error,
+    /// Encode the byte to nothing — HF `tokenizers` semantics for a BPE
+    /// model with `unk_token: null`, which silently skips symbols missing
+    /// from the vocab when building a word. The skipped symbol's neighbors
+    /// then merge with each other: tencent/Hy3 has no `\r` entry and
+    /// encodes `"\r\n\r\n"` exactly like `"\n\n"` — one merged token.
+    Drop,
 }
 
 /// Whether `b` can appear anywhere in a valid UTF-8 byte stream. `0xC0`/`0xC1`
@@ -58,20 +78,32 @@ fn is_valid_utf8_byte(b: u8) -> bool {
 }
 
 impl ByteRemapping {
+    /// Sentinel `mapping` entry for a byte with no vocab token under
+    /// [`MissingBytePolicy::Drop`]: the remap loops emit nothing for it.
+    const DROPPED: u32 = u32::MAX;
+
     /// Build the byte → token-ID table by scanning `vocab` for single-byte
     /// entries (lowest ID wins). Returns `None` when the mapping is the
-    /// identity (token ID == byte value), and an error if some byte value
-    /// that can appear in valid UTF-8 has no single-byte token.
+    /// identity (token ID == byte value); a byte value that can appear in
+    /// valid UTF-8 but has no single-byte token is handled per `missing`.
     ///
     /// A vocab may legitimately omit single-byte tokens for the bytes that
     /// never occur in valid UTF-8 (`0xC0`, `0xC1`, and `0xF5..=0xFF` — overlong
     /// and out-of-range lead bytes). Byte-level vocabularies trained only on
     /// UTF-8 text — e.g. ModernBERT / GPT-NeoX — drop them. Since such a byte
-    /// can never reach the merge loop from valid input, its absence is not an
-    /// error; we fill it with a placeholder ID so the table can never yield an
-    /// out-of-range `TokenId` even if fed malformed bytes.
-    pub fn from_byte_vocab(vocab: &[impl AsRef<[u8]>]) -> Result<Option<Self>> {
-        const UNSET: u32 = u32::MAX;
+    /// can never reach the merge loop from valid input, its absence is never
+    /// an error; when those are the only gaps we fill them with a placeholder
+    /// ID so the table can never yield an out-of-range `TokenId` even if fed
+    /// malformed bytes. Once a valid-UTF-8 byte is missing under `Drop`, ALL
+    /// gaps become [`Self::DROPPED`] instead — HF drops every unmapped
+    /// symbol alike, and only these vocabs pay the compacting remap loop.
+    pub fn from_byte_vocab(
+        vocab: &[impl AsRef<[u8]>],
+        missing: MissingBytePolicy,
+    ) -> Result<Option<Self>> {
+        // An unset entry doubles as the drop sentinel: under `Drop`, the
+        // gaps are already exactly the bytes that must encode to nothing.
+        const UNSET: u32 = ByteRemapping::DROPPED;
         let mut mapping = vec![TokenId::from(UNSET); 256];
         for (id, entry) in vocab.iter().enumerate() {
             if let &[b] = entry.as_ref()
@@ -80,27 +112,96 @@ impl ByteRemapping {
                 mapping[b as usize] = TokenId::from(id as u32);
             }
         }
-        if let Some(missing) = mapping
+        let gapped = mapping
             .iter()
             .enumerate()
-            .position(|(b, t)| t.0 == UNSET && is_valid_utf8_byte(b as u8))
-        {
-            return Err(anyhow!(
-                "Byte remapping failed: no single-byte vocab entry for byte {missing:#04x}"
-            ));
-        }
-        // Fill the tolerated (never-in-UTF-8) gaps with a safe placeholder so
-        // an unexpected malformed byte indexes a valid token instead of OOB.
-        for t in mapping.iter_mut() {
-            if t.0 == UNSET {
-                *t = TokenId::from(0);
+            .position(|(b, t)| t.0 == UNSET && is_valid_utf8_byte(b as u8));
+        let has_drops = match (gapped, missing) {
+            (Some(b), MissingBytePolicy::Error) => {
+                return Err(anyhow!(
+                    "Byte remapping failed: no single-byte vocab entry for byte {b:#04x}"
+                ));
             }
-        }
+            (Some(_), MissingBytePolicy::Drop) => true,
+            // Only never-in-UTF-8 gaps (if any): fill with a safe placeholder
+            // so an unexpected malformed byte indexes a valid token instead
+            // of OOB. Keeps complete-modulo-invalid vocabs on the
+            // non-compacting remap loops.
+            (None, _) => {
+                for t in mapping.iter_mut() {
+                    if t.0 == UNSET {
+                        *t = TokenId::from(0);
+                    }
+                }
+                false
+            }
+        };
         Ok(mapping
             .iter()
             .enumerate()
             .any(|(b, t)| t.0 != b as u32)
-            .then_some(ByteRemapping { mapping }))
+            .then_some(ByteRemapping { mapping, has_drops }))
+    }
+
+    /// Remap a short pretoken's bytes into `buf`, returning the symbol
+    /// count. Equal to `bytes.len()` except under drop semantics, where
+    /// unmapped bytes are skipped (possibly yielding 0 symbols).
+    #[inline]
+    pub(crate) fn remap_short(&self, bytes: &[u8], buf: &mut [TokenId]) -> usize {
+        if !self.has_drops {
+            for (dst, &b) in buf[..bytes.len()].iter_mut().zip(bytes) {
+                *dst = self.mapping[b as usize];
+            }
+            bytes.len()
+        } else {
+            let mut n = 0;
+            for &b in bytes {
+                let t = self.mapping[b as usize];
+                if t.0 != Self::DROPPED {
+                    buf[n] = t;
+                    n += 1;
+                }
+            }
+            n
+        }
+    }
+
+    /// Remap a pretoken's bytes onto the end of `symbols` (the long-pretoken
+    /// scratch path), skipping unmapped bytes under drop semantics.
+    #[inline]
+    pub(crate) fn remap_extend(&self, bytes: &[u8], symbols: &mut Vec<TokenId>) {
+        if !self.has_drops {
+            symbols.extend(bytes.iter().map(|&b| self.mapping[b as usize]));
+        } else {
+            symbols.extend(bytes.iter().filter_map(|&b| {
+                let t = self.mapping[b as usize];
+                (t.0 != Self::DROPPED).then_some(t)
+            }));
+        }
+    }
+
+    /// [`Self::remap_short`] over an optional remapping: the identity map
+    /// (token ID == byte value) when `br` is `None`.
+    #[inline]
+    pub(crate) fn remap_short_any(br: Option<&Self>, bytes: &[u8], buf: &mut [TokenId]) -> usize {
+        match br {
+            Some(br) => br.remap_short(bytes, buf),
+            None => {
+                for (dst, &b) in buf[..bytes.len()].iter_mut().zip(bytes) {
+                    *dst = TokenId::from(b as u32);
+                }
+                bytes.len()
+            }
+        }
+    }
+
+    /// [`Self::remap_extend`] over an optional remapping.
+    #[inline]
+    pub(crate) fn remap_extend_any(br: Option<&Self>, bytes: &[u8], symbols: &mut Vec<TokenId>) {
+        match br {
+            Some(br) => br.remap_extend(bytes, symbols),
+            None => symbols.extend(bytes.iter().map(|&b| TokenId::from(b as u32))),
+        }
     }
 }
 
@@ -184,8 +285,17 @@ impl PairRankTable {
         // Arc-shared grid. A vocab with byte tokens above the grid keeps
         // correctness — its round-1 lookups just fall through to the flat
         // table.
-        let max_initial = byte_remapping
-            .map_or(255, |br| br.mapping.iter().map(|t| t.0).max().unwrap_or(0));
+        // DROPPED sentinels are not token IDs and never reach the merge
+        // loop; letting them through would drive the grid sizing to 2^32
+        // the moment the clamp below is widened.
+        let max_initial = byte_remapping.map_or(255, |br| {
+            br.mapping
+                .iter()
+                .map(|t| t.0)
+                .filter(|&t| t != ByteRemapping::DROPPED)
+                .max()
+                .unwrap_or(0)
+        });
         let dense_log2 = (32 - max_initial.leading_zeros()).clamp(11, 11);
         let mut dense = vec![u32::MAX; 1usize << (2 * dense_log2)].into_boxed_slice();
 
@@ -1102,6 +1212,60 @@ pub use tiktoken::Tokenizer;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 257 entries: a dummy multi-byte token at ID 0, then every single
+    /// byte at ID `byte + 1` — shifted so the mapping is never the
+    /// identity. The given bytes' slots hold a multi-byte filler instead,
+    /// keeping every other byte at its `byte + 1` ID.
+    fn shifted_byte_vocab(without: &[u8]) -> Vec<Vec<u8>> {
+        std::iter::once(b"dummy".to_vec())
+            .chain((0u16..256).map(|b| {
+                if without.contains(&(b as u8)) {
+                    format!("gap{b}").into_bytes()
+                } else {
+                    vec![b as u8]
+                }
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn byte_gap_policies() {
+        // The error must name the valid-UTF-8 gap even when a tolerated
+        // never-in-UTF-8 gap (0xC0) has a smaller byte value.
+        let gap_hi = shifted_byte_vocab(&[0xC0, 0xC2]);
+        let Err(err) = ByteRemapping::from_byte_vocab(&gap_hi, MissingBytePolicy::Error) else {
+            panic!("expected a gapped vocab to be refused under Error");
+        };
+        assert!(err.to_string().contains("0xc2"), "{err}");
+
+        let gap_cr = shifted_byte_vocab(&[b'\r']);
+        assert!(ByteRemapping::from_byte_vocab(&gap_cr, MissingBytePolicy::Error).is_err());
+        let br = ByteRemapping::from_byte_vocab(&gap_cr, MissingBytePolicy::Drop)
+            .unwrap()
+            .expect("shifted IDs are not the identity");
+        assert!(br.has_drops);
+        let mut buf = [TokenId::from(0u32); 8];
+        assert_eq!(br.remap_short(b"a\rb", &mut buf), 2);
+        assert_eq!(buf[0].0, b'a' as u32 + 1);
+        assert_eq!(buf[1].0, b'b' as u32 + 1);
+        assert_eq!(br.remap_short(b"\r\r", &mut buf), 0);
+        let mut symbols = Vec::new();
+        br.remap_extend(b"\rx\r", &mut symbols);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].0, b'x' as u32 + 1);
+
+        // Gaps only at never-in-UTF-8 bytes: tolerated under both policies
+        // with the placeholder fill, never the compacting loops.
+        let invalid_only = shifted_byte_vocab(&[0xC0]);
+        for policy in [MissingBytePolicy::Error, MissingBytePolicy::Drop] {
+            let br = ByteRemapping::from_byte_vocab(&invalid_only, policy)
+                .unwrap()
+                .expect("shifted IDs are not the identity");
+            assert!(!br.has_drops);
+            assert_eq!(br.remap_short(b"ab", &mut buf), 2);
+        }
+    }
 
     /// Minimal deterministic RNG (xorshift64*) so the differential tests
     /// need no dev-dependency.

@@ -104,6 +104,10 @@ struct Model {
     /// DeepSeek V3, Llama 3).
     #[serde(default)]
     ignore_merges: bool,
+    /// HF BPE `unk_token`; decides byte-gap handling (see the
+    /// `MissingBytePolicy` choice at the `from_byte_vocab` call).
+    #[serde(default)]
+    unk_token: Option<String>,
 }
 
 fn legacy_bpe_type() -> String {
@@ -738,7 +742,15 @@ fn build_bpe(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
         entries.push((id_a, id_b, id_merged));
     }
 
-    let byte_remapping = bpe::ByteRemapping::from_byte_vocab(&vocab)?;
+    // With no unk token, HF BPE drops unmapped symbols instead of erroring
+    // (tencent/Hy3 ships no `\r` entry); with one, a byte-gap vocab would
+    // need unk substitution (never seen on a byte-level BPE) — keep the
+    // load error for that combination.
+    let missing = match tj.model.unk_token {
+        None => bpe::MissingBytePolicy::Drop,
+        Some(_) => bpe::MissingBytePolicy::Error,
+    };
+    let byte_remapping = bpe::ByteRemapping::from_byte_vocab(&vocab, missing)?;
     let vocab: Vec<Vec<u8>> = vocab.into_iter().map(|a| a.to_vec()).collect();
 
     // The fast merge loops take the merged token's ID as the merge priority,
