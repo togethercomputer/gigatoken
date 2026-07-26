@@ -105,6 +105,7 @@ impl PrecompiledCharsmap {
     /// one ASCII margin byte on each side, which non-ASCII prepend/combining
     /// characters can absorb into their cluster.
     pub(crate) fn normalize_into(&self, input: &str, out: &mut String) {
+        #[cfg(feature = "simd")]
         use std::simd::prelude::*;
 
         if !self.fast_scan {
@@ -114,9 +115,13 @@ impl PrecompiledCharsmap {
         let bytes = input.as_bytes();
         let mut i = 0usize;
         while i < bytes.len() {
-            // SIMD hop to the next attention byte (non-ASCII, control, DEL).
+            // Hop to the next attention byte (non-ASCII, control, DEL). The SIMD
+            // block is a pure accelerator over the same predicate as the scalar
+            // walk below it, so the two are equivalent by construction; `simd`
+            // is opt-in because portable_simd is nightly-only.
             let mut j = i;
             'scan: {
+                #[cfg(feature = "simd")]
                 while j + 16 <= bytes.len() {
                     let v = u8x16::from_slice(&bytes[j..]);
                     let attention = v.simd_ge(u8x16::splat(0x7F)) | v.simd_lt(u8x16::splat(0x20));
@@ -1254,6 +1259,7 @@ impl SentencePieceBPE {
         virtual_prefix: bool,
         f: &mut F,
     ) {
+        #[cfg(feature = "simd")]
         use std::simd::prelude::*;
 
         let every_mark = self.word_split == WordSplit::EveryMark;
@@ -1261,11 +1267,17 @@ impl SentencePieceBPE {
         let mut last_mark_end = usize::MAX;
         let mut first_unit = true;
 
+        #[cfg(feature = "simd")]
         let splats = self.split_bytes.map(u8x16::splat);
 
         let mut block = 0usize;
         while block < bytes.len() {
+            // 32-byte candidate mask. The SIMD branch and the scalar branch
+            // compute the identical predicate over the identical window; SIMD is
+            // opt-in because portable_simd is nightly-only.
+            #[allow(unused_mut)]
             let mut mask: u32;
+            #[cfg(feature = "simd")]
             if block + 32 <= bytes.len() {
                 let lo = u8x16::from_slice(&bytes[block..]);
                 let hi = u8x16::from_slice(&bytes[block + 16..]);
@@ -1285,6 +1297,19 @@ impl SentencePieceBPE {
             } else {
                 mask = 0;
                 for (i, &b) in bytes[block..].iter().enumerate() {
+                    if b == 0xE2 || (RAW && b == b' ') || self.split_bytes.contains(&b) {
+                        mask |= 1 << i;
+                    }
+                }
+            }
+            // Scalar-only build: same predicate, explicitly clamped to the same
+            // 32-byte window the SIMD branch consumes (the tail branch above is
+            // only reached with < 32 bytes remaining, so `1 << i` cannot overflow).
+            #[cfg(not(feature = "simd"))]
+            {
+                let end = (block + 32).min(bytes.len());
+                mask = 0;
+                for (i, &b) in bytes[block..end].iter().enumerate() {
                     if b == 0xE2 || (RAW && b == b' ') || self.split_bytes.contains(&b) {
                         mask |= 1 << i;
                     }

@@ -1,6 +1,7 @@
-#![feature(portable_simd)]
+#![cfg_attr(feature = "simd", feature(portable_simd))]
 
 pub(crate) mod batch;
+#[cfg(feature = "python")]
 pub(crate) mod bindings;
 pub(crate) mod bpe;
 pub(crate) mod bpe_train;
@@ -8,11 +9,16 @@ pub(crate) mod input;
 pub mod pretokenize;
 #[cfg(test)]
 pub(crate) mod test_hub;
-pub(crate) mod token;
+pub mod token;
 pub use crate::batch::{WorkerPool, encode_docs_ragged, sp_encode_docs_ragged};
 pub use crate::bpe::Tokenizer;
 pub use crate::bpe::sentencepiece::EncodeState;
+pub use crate::token::TokenId;
 pub mod load_tokenizer;
+
+#[cfg(feature = "python")]
+mod python_api {
+use super::*;
 
 use crate::batch::{
     encode_files_docs, encode_files_docs_serial, encode_into, sp_encode_docs_ragged_serial,
@@ -568,3 +574,5 @@ fn gigatoken_rs<'py>(py: Python, m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bindings::cache::get_max_cache_bytes, m)?)?;
     Ok(())
 }
+
+} // mod python_api
