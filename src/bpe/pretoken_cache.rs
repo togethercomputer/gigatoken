@@ -25,7 +25,10 @@
 //! with `idx` even, so both share one 64 B line, and [`Self::probe_pair`]
 //! resolves the overwhelmingly common displacement-0/1 hit branch-free from
 //! that single line. Inserts fill the first empty slot of the walk; growth
-//! doubles at 3/4 load. Key 0 marks empty slots: a real key always has its
+//! doubles at 3/4 load up to the [`MAX_SLOTS`] ceiling (past it, traffic
+//! inserts are denied and bounded seed writes may fill to at most 15/16 —
+//! the walk-termination invariant is load < 1). Key 0 marks empty slots: a
+//! real key always has its
 //! nonzero length in the top byte (`pack_pretoken_key` tags length; empty
 //! pretokens pack to key 0, which the encode loop routes to the long map,
 //! never here).
@@ -154,6 +157,24 @@ fn prefetch_line<const L1: bool>(p: *const Entry) {
     let _ = p;
 }
 
+/// Hard ceiling on the slot array: 2^22 slots x 32 B = 128 MiB. The table
+/// never evicts, so in a long-lived process (a serving router, as opposed
+/// to a batch corpus job that exits) its size otherwise grows with every
+/// unique short pretoken ever seen — an unbounded memory leak, measured at
+/// ~115 B per unique pretoken end to end. At the ceiling, inserts become
+/// no-ops at the 3/4-load threshold (lookups are unaffected, encodes stay
+/// correct — the cold tail just re-encodes). The hot working set lands long
+/// before the ceiling; natural corpora plateau far below it, and reaching
+/// it takes machine-generated cardinality (random IDs, hashes, multilingual
+/// long tails) sustained over a long process lifetime.
+pub(crate) const MAX_SLOTS: usize = 1 << 22;
+// The table's mask/pair addressing and Slots' 2 MiB alignment require a
+// power of two, and fork_sized clamps its Heaps'-law estimate into
+// [1 << 16, MAX_SLOTS] (usize::clamp panics if min > max, and a
+// non-power-of-two ceiling would let its next_power_of_two() land ABOVE
+// the ceiling). Pin both properties at compile time.
+const _: () = assert!(MAX_SLOTS.is_power_of_two() && MAX_SLOTS >= 1 << 16);
+
 pub(crate) struct ShortPretokenCache {
     slots: Slots,
     /// `cap - 1` (capacity is a power of two).
@@ -261,12 +282,78 @@ impl ShortPretokenCache {
         }
     }
 
+    /// Whether one more TRAFFIC entry can be admitted: either the table is
+    /// below its 3/4 growth threshold, or it may still grow toward the
+    /// [`MAX_SLOTS`] ceiling. Seed writes bypass this (see
+    /// [`Self::insert_seed`], which may take load up to 15/16 at the
+    /// ceiling) — the hard invariant the probe walks actually rely on is
+    /// load < 1, not 3/4. Callers that pay a side cost before inserting
+    /// (the encode miss path spills the encoding into the token arena
+    /// first) MUST check this up front: spilling and then having the
+    /// insert denied would strand unreferenced arena bytes forever, and
+    /// once enough of those pile up they exhaust the arena ceiling for
+    /// everyone else.
+    pub(crate) fn has_insert_room(&self) -> bool {
+        (self.len + 1) * 4 <= self.slots.cap * 3 || self.slots.cap < MAX_SLOTS
+    }
+
     /// Insert a key known to be absent (the encode loop only inserts after
-    /// a [`Self::get_or_slot`] miss).
+    /// a [`Self::get_or_slot`] miss). A no-op once traffic saturation is
+    /// reached (3/4 load at [`MAX_SLOTS`], see [`Self::has_insert_room`]).
+    /// Past that point only bounded seed writes ([`Self::insert_seed`],
+    /// hard-stopped at 15/16 load) may fill the table further; the
+    /// walk-terminating invariant `get_or_slot`/`first_empty` rely on is
+    /// load < 1, which every path preserves.
     pub(crate) fn insert(&mut self, key: u128, h: u64, val: u64, ext: u64) {
         debug_assert_ne!(key, EMPTY_KEY);
+        // has_insert_room() is THE ceiling predicate: callers that pay a
+        // side cost before inserting check it first, and the F2-class
+        // orphaning fix depends on "check true => insert lands", so insert
+        // and insert_at must deny on exactly this condition and nothing
+        // else.
+        if !self.has_insert_room() {
+            return;
+        }
         if (self.len + 1) * 4 > self.slots.cap * 3 {
             self.grow();
+        }
+        let idx = self.first_empty(h);
+        // SAFETY: first_empty returns an in-bounds index.
+        unsafe { *self.slots.get_mut(idx) = Entry { key, val, ext } };
+        self.len += 1;
+    }
+
+    /// [`Self::insert`] for loader-phase seed data that is load-bearing
+    /// for correctness (see [`Self::replace`]): an added-token overwrite
+    /// that failed to land would make this instance emit different ids
+    /// than a fresh fork of it for the same input.
+    ///
+    /// At the [`MAX_SLOTS`] ceiling this inserts WITHOUT growing rather
+    /// than growing without the ceiling: a ceiling-exempt grow would hand
+    /// the (new_cap*3/4 - len) slots of fresh headroom straight back to
+    /// ordinary traffic, turning the ceiling into a doubling ratchet
+    /// (every "saturate, then register one added token" cycle would
+    /// double the table geometrically). Inserting past the 3/4 mark is
+    /// safe for the probe-walk invariant as long as load stays strictly
+    /// below 1; seed cardinality (vocabulary + added tokens, ~150k for
+    /// the largest real vocab) against MAX_SLOTS' 4.2M slots moves load
+    /// from 0.750 to at most ~0.79. The 15/16 hard stop below is
+    /// unreachable by any real vocabulary (it needs >780k seed writes
+    /// AFTER runtime saturation) and exists purely so a pathological
+    /// caller degrades to a denied cache write instead of an
+    /// ever-slower-walking table.
+    fn insert_seed(&mut self, key: u128, h: u64, val: u64, ext: u64) {
+        debug_assert_ne!(key, EMPTY_KEY);
+        if (self.len + 1) * 4 > self.slots.cap * 3 {
+            if self.slots.cap >= MAX_SLOTS {
+                if (self.len + 1) * 16 > self.slots.cap * 15 {
+                    debug_assert!(false, "seed writes exceeded 15/16 load at MAX_SLOTS");
+                    return;
+                }
+                // fall through: insert without growing
+            } else {
+                self.grow();
+            }
         }
         let idx = self.first_empty(h);
         // SAFETY: first_empty returns an in-bounds index.
@@ -277,9 +364,16 @@ impl ShortPretokenCache {
     /// [`Self::insert`] with the destination already known from a
     /// [`Self::get_or_slot`] miss on the same `key`/`h` (with no insert or
     /// grow in between), skipping the `first_empty` chain walk. A growth
-    /// pass invalidates `slot`, so that branch recomputes it.
+    /// pass invalidates `slot`, so that branch recomputes it. Same
+    /// saturation no-op as [`Self::insert`].
     pub(crate) fn insert_at(&mut self, slot: usize, key: u128, h: u64, val: u64, ext: u64) {
         debug_assert_ne!(key, EMPTY_KEY);
+        // Same single ceiling predicate as [`Self::insert`] — see the
+        // comment there for why denial must match has_insert_room()
+        // exactly.
+        if !self.has_insert_room() {
+            return;
+        }
         let mut slot = slot;
         if (self.len + 1) * 4 > self.slots.cap * 3 {
             self.grow();
@@ -296,7 +390,10 @@ impl ShortPretokenCache {
     /// entry point for the vocab-seed sync (`set_added_tokens`' overwrite
     /// and restore loops and `fork_sized`'s added-token re-apply), where
     /// an added token's content can duplicate an already-seeded vocab
-    /// byte string and must take over its entry.
+    /// byte string and must take over its entry. Exempt from the
+    /// [`MAX_SLOTS`] ceiling: seed overwrites are correctness data — a
+    /// denied one would let a saturated parent and its (fresh, unsaturated)
+    /// fork emit different ids for the same input.
     pub(crate) fn replace(&mut self, key: u128, h: u64, val: u64, ext: u64) {
         debug_assert_ne!(key, EMPTY_KEY);
         let mut idx = (h as usize) & self.mask & !1;
@@ -314,8 +411,8 @@ impl ShortPretokenCache {
                 return;
             }
             if k0 == EMPTY_KEY || k1 == EMPTY_KEY {
-                // Absent: a fresh insert (with its own growth check).
-                self.insert(key, h, val, ext);
+                // Absent: a fresh ceiling-exempt insert (seed data).
+                self.insert_seed(key, h, val, ext);
                 return;
             }
             idx = (idx + 2) & self.mask;

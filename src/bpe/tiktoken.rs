@@ -121,6 +121,51 @@ fn nfc_segment<'a>(seg: &'a [u8], buf: &'a mut String) -> &'a [u8] {
 /// `ext` unused.
 const VAL_SPILL: u64 = 0x80;
 
+/// Ceilings on the two remaining unbounded cache stores, mirroring
+/// `ShortPretokenCache`'s `MAX_SLOTS` (see its doc for the leak rationale:
+/// none of these structures evict, so a long-lived process otherwise grows
+/// forever with unique-pretoken cardinality).
+///
+/// - `MAX_ARENA_TOKENS`: 2^22 tokens x 4 B = 16 MiB. Enforced as a SUM
+///   check (`arena.len() + symbols.len() <= MAX`) so no single entry can
+///   overshoot it. Also protects the packed-value format: spilled entries
+///   store the arena offset in 32 bits, which silently wraps past 2^32
+///   arena tokens. (Loader-phase seed spills are exempt like the seed
+///   inserts in `pretoken_cache.rs` — bounded by the vocabulary, and their
+///   values are correctness data.)
+/// - `MAX_LONG_CACHE_ENTRIES`: entry-count ceiling for the long-pretoken
+///   map. Its `Box<[u8]>` keys are additionally bounded per entry by
+///   `MAX_CACHED_PRETOKEN_BYTES`, so bytes are capped too.
+/// - `MAX_CACHED_PRETOKEN_BYTES`: a single pretoken has no grammar-imposed
+///   length bound (a `\p{L}+` run is one pretoken however long it is), so
+///   an uncapped cache would let one degenerate multi-megabyte "word"
+///   permanently retain megabytes of key + arena in one request. Pretokens
+///   longer than this are encoded but never cached. To be clear about the
+///   trade: the cache win is LARGEST for huge pretokens (the merge loop is
+///   what's expensive), but so is the retained memory per entry — this cap
+///   prices memory, and a workload that repeatedly encodes >1 KiB single
+///   pretokens pays the merge each time.
+///
+/// At a ceiling the miss path skips caching (output is computed either
+/// way); lookups and correctness are unaffected. These bounds are per
+/// `Tokenizer` INSTANCE: a process-level bound is (instances x per-instance
+/// ceilings) — e.g. a serving pool of 8 slots tops out at 8x, and a
+/// `WorkerPool` keeps one warm fork per rayon thread. The adversarial
+/// per-instance worst case is ~128 MiB table + 16 MiB arena + long-map
+/// keys (entry-capped at MAX_CACHED_PRETOKEN_BYTES each; the arena sum
+/// gate bounds their aggregate at roughly `MAX_ARENA_TOKENS x
+/// bytes-per-token`, ~100 MB-class for adversarial input) — a hard bound,
+/// but well above what natural corpora reach. Saturation is observable via
+/// [`Tokenizer::cache_saturation`].
+const MAX_ARENA_TOKENS: usize = 1 << 22;
+const MAX_LONG_CACHE_ENTRIES: usize = 1 << 18;
+const MAX_CACHED_PRETOKEN_BYTES: usize = 1024;
+// cache_saturation()'s arena margin adds MAX_CACHED_PRETOKEN_BYTES (a byte
+// count, used as the upper bound on one entry's post-merge token count —
+// BPE only merges, so tokens <= bytes) to a token count; that is only
+// conservative while the cap stays small next to the arena ceiling.
+const _: () = assert!(MAX_CACHED_PRETOKEN_BYTES <= MAX_ARENA_TOKENS / 64);
+
 #[inline(always)]
 fn pack_val_inline(symbols: &[TokenId]) -> Option<(u64, u64)> {
     match *symbols {
@@ -647,10 +692,14 @@ impl Tokenizer {
         // slots (128 MB) per worker.
         let distinct = 3.45 * (expected_bytes as f64).powf(0.62);
         let cache_slots = ((distinct * (4.0 / 3.0) * 1.4) as usize)
-            .clamp(1 << 16, 1 << 22)
+            .clamp(1 << 16, super::pretoken_cache::MAX_SLOTS)
             .next_power_of_two();
-        let arena_cap = (expected_bytes / 256).min(1 << 24);
-        let long_cap = (expected_bytes / 8192).min(1 << 20);
+        // Presizes must not exceed the runtime ceilings: capacity beyond
+        // MAX_ARENA_TOKENS / MAX_LONG_CACHE_ENTRIES is allocated up front
+        // (`with_capacity`) but can never be filled, so it would be pure
+        // resident waste per worker.
+        let arena_cap = (expected_bytes / 256).min(MAX_ARENA_TOKENS);
+        let long_cap = (expected_bytes / 8192).min(MAX_LONG_CACHE_ENTRIES);
         let mut token_arena = Vec::with_capacity(arena_cap);
         let mut pretoken_cache = Self::seeded_pretoken_cache(
             &self.vocab,
@@ -778,6 +827,22 @@ impl Tokenizer {
     /// Loader-phase mutator: must run before any `WorkerPool` forks
     /// workers from this tokenizer — already-forked workers keep the old
     /// added-token set (see [`WorkerPool`]).
+    ///
+    /// Loader-phase seed spills here (and in the restore loop below) are
+    /// deliberately exempt from `MAX_ARENA_TOKENS` — they are correctness
+    /// data, bounded per call by the merge-unreachable short-vocab entries
+    /// (a few hundred for real vocabularies; merge-reachable added tokens
+    /// pack inline and never touch the arena). Two costs to know about:
+    /// each call re-packs every registered token and abandons the previous
+    /// spill region, so registering N tokens one at a time (as
+    /// `add_special_token` does, and as the tiktoken loader's
+    /// registration loop does) runs O(N^2) `replace()` calls AND O(N^2)
+    /// abandoned arena tokens in a single cold load when the contents are
+    /// merge-unreachable; and a long-lived process that HOT-RELOADS added
+    /// tokens grows the arena per reload with no ceiling across reloads.
+    /// In-tree callers are one-shot loader-phase with real vocabularies,
+    /// where both are noise — batch registration via a single
+    /// `set_added_tokens` call avoids the quadratic term entirely.
     ///
     /// [`WorkerPool`]: crate::batch::WorkerPool
     pub fn set_added_tokens(&mut self, added_tokens: Vec<AddedTokenDef>) {
@@ -1247,8 +1312,18 @@ impl Tokenizer {
                 &mut buf,
             );
             let symbols = &buf[..n];
-            let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
-            self.pretoken_cache.insert_at(slot, key, h, val, ext);
+            // Cache best-effort. The table-room check MUST come first: a
+            // spill into the arena followed by a denied insert would strand
+            // those arena tokens unreferenced forever, and enough of them
+            // would exhaust the arena ceiling for the long cache too. The
+            // arena check is a sum so the entry fits entirely or not at all.
+            if self.pretoken_cache.has_insert_room()
+                && (pack_val_inline(symbols).is_some()
+                    || self.token_arena.len() + symbols.len() <= MAX_ARENA_TOKENS)
+            {
+                let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
+                self.pretoken_cache.insert_at(slot, key, h, val, ext);
+            }
             out.extend_from_slice(token_ids_as_u32s(symbols));
         } else {
             // Mirrors the long-pretoken arm of `encode_pretoken_miss`,
@@ -1267,10 +1342,22 @@ impl Tokenizer {
                 }
                 bpe_merge_symbols_ranked(&rm, symbols);
             }
-            let len = symbols.len() as u32;
-            let offset = self.token_arena.len() as u32;
-            self.token_arena.extend_from_slice(symbols);
-            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            // Cache best-effort: long entries always spill to the arena and
+            // carry owned keys, so every ceiling gates the insert — the
+            // per-pretoken byte cap (one degenerate megabyte-long "word"
+            // must not retain megabytes of key + arena), the map's entry
+            // ceiling, and the arena SUM ceiling (fits entirely or not at
+            // all — a bare `< MAX` check would let one entry overshoot the
+            // ceiling by its own unbounded length).
+            if bytes.len() <= MAX_CACHED_PRETOKEN_BYTES
+                && self.pretoken_cache_long.len() < MAX_LONG_CACHE_ENTRIES
+                && self.token_arena.len() + symbols.len() <= MAX_ARENA_TOKENS
+            {
+                let len = symbols.len() as u32;
+                let offset = self.token_arena.len() as u32;
+                self.token_arena.extend_from_slice(symbols);
+                self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            }
             out.extend_from_slice(token_ids_as_u32s(symbols));
         }
     }
@@ -1318,8 +1405,18 @@ impl Tokenizer {
                 &mut buf,
             );
             let symbols = &buf[..n];
-            let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
-            self.pretoken_cache.insert_at(slot, key, h, val, ext);
+            // Cache best-effort. The table-room check MUST come first: a
+            // spill into the arena followed by a denied insert would strand
+            // those arena tokens unreferenced forever, and enough of them
+            // would exhaust the arena ceiling for the long cache too. The
+            // arena check is a sum so the entry fits entirely or not at all.
+            if self.pretoken_cache.has_insert_room()
+                && (pack_val_inline(symbols).is_some()
+                    || self.token_arena.len() + symbols.len() <= MAX_ARENA_TOKENS)
+            {
+                let (val, ext) = Self::pack_val(symbols, &mut self.token_arena);
+                self.pretoken_cache.insert_at(slot, key, h, val, ext);
+            }
             out.extend_from_slice(token_ids_as_u32s(symbols));
         } else {
             // Long pretoken (> 15 bytes, rare): remap and run the merge
@@ -1358,10 +1455,22 @@ impl Tokenizer {
                     ),
                 }
             }
-            let len = symbols.len() as u32;
-            let offset = self.token_arena.len() as u32;
-            self.token_arena.extend_from_slice(symbols);
-            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            // Cache best-effort: long entries always spill to the arena and
+            // carry owned keys, so every ceiling gates the insert — the
+            // per-pretoken byte cap (one degenerate megabyte-long "word"
+            // must not retain megabytes of key + arena), the map's entry
+            // ceiling, and the arena SUM ceiling (fits entirely or not at
+            // all — a bare `< MAX` check would let one entry overshoot the
+            // ceiling by its own unbounded length).
+            if bytes.len() <= MAX_CACHED_PRETOKEN_BYTES
+                && self.pretoken_cache_long.len() < MAX_LONG_CACHE_ENTRIES
+                && self.token_arena.len() + symbols.len() <= MAX_ARENA_TOKENS
+            {
+                let len = symbols.len() as u32;
+                let offset = self.token_arena.len() as u32;
+                self.token_arena.extend_from_slice(symbols);
+                self.pretoken_cache_long.insert(bytes.into(), (offset, len));
+            }
             out.extend_from_slice(token_ids_as_u32s(symbols));
         }
     }
@@ -1370,6 +1479,26 @@ impl Tokenizer {
         v.iter()
             .flat_map(|&token| self.vocab[token.0 as usize].as_ref())
             .copied()
+    }
+
+    /// Which cache ceilings this instance has reached:
+    /// `(short_table, token_arena, long_map)`. A saturated store stops
+    /// admitting new TRAFFIC entries (correctness is unaffected; the cold
+    /// tail re-encodes; the short-table flag means "traffic denied at 3/4
+    /// load", though bounded seed writes may still land up to 15/16), so a
+    /// long-lived embedder should surface this once —
+    /// otherwise the only production symptom is an unexplained loss of the
+    /// cache speedup. The arena flag uses the worst single entry the sum
+    /// gates admit (`MAX_CACHED_PRETOKEN_BYTES` bytes, hence at most that
+    /// many post-merge tokens — BPE only merges) as its margin, so it is
+    /// conservative: it turns true AT OR BEFORE the first denied long-arm
+    /// insert, early by at most one worst-case entry.
+    pub fn cache_saturation(&self) -> (bool, bool, bool) {
+        (
+            !self.pretoken_cache.has_insert_room(),
+            self.token_arena.len() + MAX_CACHED_PRETOKEN_BYTES > MAX_ARENA_TOKENS,
+            self.pretoken_cache_long.len() >= MAX_LONG_CACHE_ENTRIES,
+        )
     }
 
     /// Detailed cache stats for memory accounting (see examples/cache_memory.rs):
