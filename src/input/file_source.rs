@@ -331,11 +331,14 @@ fn pretokenize_file(
 
 /// Reads from a `BufRead` and yields documents split on a byte separator.
 /// Each `next()` returns one document (the bytes between two separators).
-/// Buffers only the current document, not the entire input.
+/// Buffers only the unreturned input, not the entire stream.
 struct SeparatorReader<R> {
     reader: R,
     separator: Vec<u8>,
+    finder: memchr::memmem::Finder<'static>,
     buf: Vec<u8>,
+    /// Where the next search starts; everything before it has been searched.
+    search_from: usize,
     finished: bool,
 }
 
@@ -344,7 +347,9 @@ impl<R: std::io::BufRead> SeparatorReader<R> {
         Self {
             reader,
             separator: separator.to_vec(),
+            finder: memchr::memmem::Finder::new(separator).into_owned(),
             buf: Vec::with_capacity(4096),
+            search_from: 0,
             finished: false,
         }
     }
@@ -366,10 +371,24 @@ impl<R: std::io::BufRead> Iterator for SeparatorReader<R> {
             return if all.is_empty() { None } else { Some(all) };
         }
 
-        let finder = memchr::memmem::Finder::new(&self.separator);
-        self.buf.clear();
-
+        // The bytes left in `buf` after a returned document can already hold
+        // further separators (one read often delivers several documents), so
+        // search what is buffered before reading more; clearing it here
+        // dropped every document after the first in each read.
         loop {
+            if let Some(pos) = self.finder.find(&self.buf[self.search_from..]) {
+                let sep_start = self.search_from + pos;
+                let doc = self.buf[..sep_start].to_vec();
+                self.buf.drain(..sep_start + self.separator.len());
+                self.search_from = 0;
+                // Skip empty documents
+                if !doc.is_empty() {
+                    return Some(doc);
+                }
+                continue;
+            }
+            // A separator may straddle the searched tail and the next read.
+            self.search_from = self.buf.len().saturating_sub(self.separator.len() - 1);
             let available = match self.reader.fill_buf() {
                 Ok([]) => {
                     // EOF
@@ -386,33 +405,9 @@ impl<R: std::io::BufRead> Iterator for SeparatorReader<R> {
                     return None;
                 }
             };
-
-            // Search for separator in: [tail of buf where separator could span] + available
-            // We need to handle the case where the separator spans the boundary between
-            // self.buf and the new `available` data.
-            let overlap = self.separator.len().saturating_sub(1).min(self.buf.len());
-            let search_start = self.buf.len() - overlap;
-
-            // Append available to buf, then search from search_start
             self.buf.extend_from_slice(available);
             let consumed = available.len();
             self.reader.consume(consumed);
-
-            if let Some(pos) = finder.find(&self.buf[search_start..]) {
-                let sep_start = search_start + pos;
-                let doc = self.buf[..sep_start].to_vec();
-                // Keep everything after the separator for the next call
-                let remainder_start = sep_start + self.separator.len();
-                let remainder = self.buf[remainder_start..].to_vec();
-                self.buf = remainder;
-
-                // Skip empty documents
-                if doc.is_empty() {
-                    continue;
-                }
-                return Some(doc);
-            }
-            // No separator found yet — continue reading
         }
     }
 }
@@ -510,5 +505,28 @@ mod tests {
 
         // unknown → plain text, no compression
         assert!(matches!(detect_format(Path::new("data.csv")), (ContentFormat::PlainText, Compression::None)));
+    }
+
+    #[test]
+    fn test_separator_reader() {
+        let cases: [(&[u8], &[&[u8]]); 5] = [
+            (b"aaa<SEP>bbb<SEP><SEP>ccc", &[b"aaa", b"bbb", b"ccc"]),
+            (b"<SEP>hello<SEP>", &[b"hello"]),
+            (b"<SEP><SEP>", &[]),
+            (b"a<SEP>b<SEP>c", &[b"a", b"b", b"c"]),
+            (b"", &[]),
+        ];
+        // Small capacities force separators across reads; the default
+        // delivers several per read.
+        for cap in [1, 2, 3, 7, 8192] {
+            for (data, want) in cases {
+                let reader = std::io::BufReader::with_capacity(cap, data);
+                let docs: Vec<Vec<u8>> = SeparatorReader::new(reader, b"<SEP>").collect();
+                assert_eq!(docs, want, "cap {cap}: {:?}", String::from_utf8_lossy(data));
+            }
+        }
+        let reader = std::io::BufReader::new(&b"one document"[..]);
+        let docs: Vec<Vec<u8>> = SeparatorReader::new(reader, b"").collect();
+        assert_eq!(docs, [b"one document".to_vec()]);
     }
 }
