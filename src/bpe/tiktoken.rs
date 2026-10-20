@@ -129,6 +129,14 @@ impl CacheBudget {
     /// ~7/8 load + malloc overhead of the boxed key).
     const LONG_ENTRY_BYTES: usize = 48;
 
+    /// Arena sub-budget ceiling in tokens. Spilled short-table values
+    /// and long-map entries store their arena offset in 32 bits
+    /// (`pack_val`, the long map's `(offset, len)`), so the arena must
+    /// stay below 2^32 tokens or offsets wrap and hits serve the wrong
+    /// tokens. 2^31 leaves the `max_encoding` slack room under that;
+    /// without the cap, any budget above ~32 GiB could wrap.
+    const MAX_ARENA_ENTRIES: usize = 1 << 31;
+
     /// Split `total_bytes` between the three caches given the seed
     /// footprint (`n_seed` short entries, `seed_arena_len` arena
     /// entries). Allocates nothing.
@@ -156,7 +164,9 @@ impl CacheBudget {
         CacheBudget {
             total_bytes,
             short_slots,
-            arena_entries: ((rem / 2) / 4).max(seed_arena_len * 2 + 4096),
+            arena_entries: ((rem / 2) / 4)
+                .max(seed_arena_len * 2 + 4096)
+                .min(Self::MAX_ARENA_ENTRIES),
             long_bytes: (rem / 2).max(64 << 10),
             long_bytes_used: 0,
             max_encoding: 0,
@@ -2278,6 +2288,25 @@ mod tests {
         assert!(gens <= 10, "wipe-thrash: {gens} wipes for ~124k distinct pretokens");
         let (_, short_cap, ..) = tok.cache_mem_stats();
         assert_eq!(short_cap, short_slots, "a wiping table sits exactly at its ceiling");
+    }
+
+    /// ARENA OFFSET WIDTH: arena offsets are stored in 32 bits, so no
+    /// budget may let the arena sub-budget (plus its giant-encoding
+    /// slack) reach 2^32 tokens, however large the configured total.
+    #[test]
+    fn budget_split_keeps_arena_offsets_in_32_bits() {
+        for total in [512usize << 20, 32 << 30, 64 << 30, 1 << 40, usize::MAX] {
+            let b = CacheBudget::derive(total, 150_000, 1 << 20);
+            assert!(
+                b.arena_entries <= CacheBudget::MAX_ARENA_ENTRIES,
+                "{total} B budget gives a {}-token arena",
+                b.arena_entries
+            );
+        }
+        // Budgets the cap does not bind on keep their proportional split.
+        let b = CacheBudget::derive(512 << 20, 150_000, 1 << 20);
+        assert!(b.arena_entries < CacheBudget::MAX_ARENA_ENTRIES);
+        assert_eq!(b.arena_entries, ((512 << 20) - b.short_slots * 32) / 8);
     }
 
     /// GIANT PRETOKEN: a recurring pretoken whose encoding alone exceeds
