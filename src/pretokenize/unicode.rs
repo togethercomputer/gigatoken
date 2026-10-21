@@ -239,6 +239,59 @@ pub(crate) fn ds_class_of(cp: u32) -> DsCharClass {
     DsClassTable::get().ds_class_of(cp)
 }
 
+// The DeepSeek Split regexes must use the same Unicode version as their
+// serving implementation. Keep a separate table so this does not change
+// the ICU properties used by Qwen3.5 or the other pretokenizers.
+static DEEPSEEK_UNICODE16_TABLE: std::sync::LazyLock<Box<[u8]>> = std::sync::LazyLock::new(|| {
+    use unicode_general_category::{GeneralCategory as Gc, get_general_category};
+    assert_eq!(unicode_general_category::UNICODE_VERSION, (16, 0, 0));
+    let classes: Vec<u8> = (0..0x110000)
+        .map(|cp| {
+            let Some(c) = char::from_u32(cp) else {
+                return DsCharClass::Other as u8;
+            };
+            let class = match get_general_category(c) {
+                Gc::UppercaseLetter
+                | Gc::LowercaseLetter
+                | Gc::TitlecaseLetter
+                | Gc::ModifierLetter
+                | Gc::OtherLetter => DsCharClass::Letter,
+                Gc::DecimalNumber | Gc::LetterNumber | Gc::OtherNumber => DsCharClass::Number,
+                Gc::NonspacingMark | Gc::SpacingMark | Gc::EnclosingMark => DsCharClass::Mark,
+                Gc::ConnectorPunctuation
+                | Gc::DashPunctuation
+                | Gc::OpenPunctuation
+                | Gc::ClosePunctuation
+                | Gc::InitialPunctuation
+                | Gc::FinalPunctuation
+                | Gc::OtherPunctuation
+                | Gc::MathSymbol
+                | Gc::CurrencySymbol
+                | Gc::ModifierSymbol
+                | Gc::OtherSymbol => DsCharClass::PunctSym,
+                _ if matches!(cp, 0x9..=0xd | 0x20 | 0x85 | 0xa0 | 0x1680
+                        | 0x2000..=0x200a | 0x2028..=0x2029 | 0x202f | 0x205f | 0x3000) =>
+                {
+                    DsCharClass::Whitespace
+                }
+                _ => DsCharClass::Other,
+            };
+            class as u8
+        })
+        .collect();
+    classes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| c[0] | (c[1] << 4))
+        .collect()
+});
+
+#[inline(always)]
+pub(crate) fn deepseek_unicode16_class_of(cp: u32) -> DsCharClass {
+    DsClassTable(&DEEPSEEK_UNICODE16_TABLE).ds_class_of(cp)
+}
+
 // ---------------------------------------------------------------------------
 // o200k character classes (case-aware split of Letter)
 // ---------------------------------------------------------------------------

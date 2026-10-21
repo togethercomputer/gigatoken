@@ -22,11 +22,13 @@
 //! `is_deepseek_cjk(cp) == cjk_region`.
 
 use super::{
-    decode_cp, is_ascii_ws, is_digit, is_letter, scan_newlines, scan_numbers_max3,
+    decode_cp, is_ascii_ws, is_digit, is_letter, scan_newlines,
     swar_scan_letters,
 };
 use crate::pretokenize::Pretoken;
-use crate::pretokenize::unicode::{DsCharClass, ds_class_of, is_deepseek_cjk};
+use crate::pretokenize::unicode::{
+    DsCharClass, deepseek_unicode16_class_of as ds_class_of, is_deepseek_cjk,
+};
 
 pub struct FastDeepSeekV3Pretokenizer<'a> {
     bytes: &'a [u8],
@@ -367,6 +369,27 @@ fn advance_cjk(bytes: &[u8], pos: usize) -> usize {
     }
 }
 
+#[inline(always)]
+fn scan_numbers_max3(bytes: &[u8], mut pos: usize, mut consumed: u32) -> usize {
+    while consumed < 3 && pos < bytes.len() {
+        let b = bytes[pos];
+        let len = if is_digit(b) {
+            1
+        } else if b >= 0x80 {
+            let (cp, len) = unsafe { decode_cp(bytes, pos) };
+            if ds_class_of(cp) != DsCharClass::Number {
+                break;
+            }
+            len
+        } else {
+            break;
+        };
+        pos += len;
+        consumed += 1;
+    }
+    pos
+}
+
 /// Advance past one token starting at `pos`. Returns the new position.
 /// `pos` must be < `bytes.len()`.
 #[inline(always)]
@@ -439,6 +462,19 @@ mod tests {
         FastDeepSeekV3Pretokenizer::new(s.as_bytes())
             .map(|t| String::from_utf8_lossy(t.0).into_owned())
             .collect()
+    }
+
+    #[test]
+    fn deepseek_unicode16_unassigned_scalars() {
+        for scalar in ['\u{1ae5}', '\u{1ae8}', '\u{32795}'] {
+            let text = format!(" {scalar}a");
+            assert_eq!(
+                fast_tokens(&text),
+                vec![" ".to_owned(), format!("{scalar}a")]
+            );
+        }
+        // A Unicode-17 digit must not extend a Unicode-16 number run.
+        assert_eq!(fast_tokens("1\u{11de0}"), vec!["1", "\u{11de0}"]);
     }
 
     #[test]

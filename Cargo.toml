@@ -32,6 +32,8 @@ rustc-hash = "2.1"
 memmap2 = { version = "0.9", features = ["stable_deref_trait"] }
 base64 = "0.22"
 icu = { version = "2.2", features = ["compiled_data", "datagen"] }
+# DeepSeek's HF/serving regexes use Unicode 16 properties.
+unicode-general-category = "=1.0.0"
 eyre = "0.6.12"
 sonic-rs = "0.5.8"
 memchr = "2.8.0"
