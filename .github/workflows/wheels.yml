@@ -41,6 +41,16 @@ jobs:
           rust-toolchain: nightly
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          # CVE-2026-111943: refresh the build container's OS trust store (fails if still unfixed)
+          before-script-linux: |
+            if command -v apt-get >/dev/null 2>&1 && dpkg-query -W ca-certificates >/dev/null 2>&1; then
+              apt-get update && apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/*
+              v=$(dpkg-query -W -f='${Version}' ca-certificates)
+              dpkg --compare-versions "$v" ge 20260816 || { echo "ca-certificates $v is still vulnerable"; exit 1; }
+            elif command -v yum >/dev/null 2>&1 && [ -n "${SSL_CERT_FILE:-}" ]; then
+              if grep -q 'emSign ECC Root CA - G3' "$SSL_CERT_FILE"; then echo "$SSL_CERT_FILE is still vulnerable"; exit 1; fi
+              cp "$SSL_CERT_FILE" /etc/pki/tls/certs/ca-bundle.crt
+            fi
           args: --release --locked --out dist --compatibility pypi
 
       - name: Upload wheel

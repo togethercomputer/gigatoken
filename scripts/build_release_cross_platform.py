@@ -181,7 +181,14 @@ def build_windows_wheels() -> None:
 
 def build_linux_wheel(architecture: str, target: str) -> None:
     docker_platform = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}[architecture]
-    container_command = (
+    # CVE-2026-111943: the maturin image (CentOS 7) ships a stale trust store; upgrade
+    # certifi and install its bundle as the OS/SSL_CERT_FILE bundle, failing if unfixed.
+    trust_refresh = (
+        "python3 -m pip install -q --upgrade 'certifi>=2026.10.19' && "
+        'b="$(python3 -m certifi)" && ! grep -q "emSign ECC Root CA - G3" "$b" && '
+        'cp "$b" /etc/pki/tls/certs/ca-bundle.crt && cp "$b" "$SSL_CERT_FILE" && '
+    )
+    container_command = trust_refresh + (
         f"rustup toolchain install nightly --profile minimal && maturin build --release --locked --target {target} --manylinux 2014 --target-dir /tmp/gigatoken-target --out /out"
     )
     run(
