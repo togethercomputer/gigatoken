@@ -407,6 +407,22 @@ pub struct MergeScratch {
     heap: Vec<std::cmp::Reverse<u64>>,
 }
 
+impl MergeScratch {
+    /// Drop the buffers' contents and shrink each to `keep` elements when
+    /// one holds more (after a giant pretoken grew them).
+    pub(crate) fn shrink_to(&mut self, keep: usize) {
+        fn shrink<T>(v: &mut Vec<T>, keep: usize) {
+            if v.capacity() > keep {
+                v.clear();
+                v.shrink_to(keep);
+            }
+        }
+        shrink(&mut self.next, keep);
+        shrink(&mut self.prev, keep);
+        shrink(&mut self.heap, keep);
+    }
+}
+
 /// Pack a heap entry as `(merged_token << 32) | position`. `u64` ordering then
 /// matches the old `(TokenId, usize)` tuple ordering (token ID first, position
 /// as tie-break) while halving the element size the heap has to shuffle.

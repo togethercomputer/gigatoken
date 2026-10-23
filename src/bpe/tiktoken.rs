@@ -114,14 +114,27 @@ struct CacheBudget {
     /// Long-map bytes this generation, maintained at the two long-map
     /// insert sites; wipes reset it.
     long_bytes_used: usize,
-    /// Largest single encoding (in tokens) appended to the arena. The
-    /// arena wipe trigger allows this much slack past `arena_entries`,
-    /// so one recurring giant pretoken whose encoding alone exceeds the
-    /// sub-budget cannot force a wipe per occurrence. Kept across wipes
-    /// (it describes the corpus, not the generation).
+    /// Largest single encoding (in tokens) appended to the arena, at most
+    /// `arena_entries / LONG_ADMIT_DIVISOR` (a larger one is served
+    /// uncached). The arena wipe trigger allows this much slack past
+    /// `arena_entries`, so one recurring large pretoken cannot force a
+    /// wipe per occurrence. Kept across wipes (it describes the corpus,
+    /// not the generation).
     max_encoding: usize,
     /// Wipes since the budget was set (or since this fork was created).
     generations: u64,
+}
+
+/// Scratch capacity (in symbols) a budgeted tokenizer keeps between long
+/// misses; a pretoken that grew more gives the excess back.
+const SCRATCH_KEEP: usize = 1 << 16;
+
+/// Drop `v`'s contents and shrink it to `keep` when it holds more.
+fn shrink_scratch<T>(v: &mut Vec<T>, keep: usize) {
+    if v.capacity() > keep {
+        v.clear();
+        v.shrink_to(keep);
+    }
 }
 
 impl CacheBudget {
@@ -136,6 +149,21 @@ impl CacheBudget {
     /// tokens. 2^31 leaves the `max_encoding` slack room under that;
     /// without the cap, any budget above ~32 GiB could wrap.
     const MAX_ARENA_ENTRIES: usize = 1 << 31;
+
+    /// Largest share of a sub-budget a single long entry may take. The
+    /// budget check runs only at the top of the next miss and hits never
+    /// evict, so an admitted entry stays until then: without a limit, one
+    /// giant pretoken (attacker-sized, e.g. an 8 MiB run of one letter)
+    /// would hold a slot at several times its cap. A long pretoken over
+    /// the limit is encoded and served, just not cached. It also bounds
+    /// the arena trigger's `max_encoding` slack to the same share.
+    const LONG_ADMIT_DIVISOR: usize = 8;
+
+    /// Whether a long entry with this key and encoding may be cached.
+    fn admits_long(&self, key_bytes: usize, tokens: usize) -> bool {
+        key_bytes + Self::LONG_ENTRY_BYTES <= self.long_bytes / Self::LONG_ADMIT_DIVISOR
+            && tokens <= self.arena_entries / Self::LONG_ADMIT_DIVISOR
+    }
 
     /// Split `total_bytes` between the three caches given the seed
     /// footprint (`n_seed` short entries, `seed_arena_len` arena
@@ -907,6 +935,12 @@ impl Tokenizer {
     /// them. Cache contents never affect encode output, so a wipe only
     /// costs re-misses on previously cached pretokens.
     ///
+    /// The bound is approximate, not a hard ceiling: the check runs at the
+    /// top of the next miss, so a slot can sit past it by what one miss
+    /// added (a long entry may take at most 1/8 of its sub-budget; longer
+    /// pretokens are served uncached), and the long map's per-entry
+    /// overhead is an estimate.
+    ///
     /// The short table takes the largest power-of-two slot count with
     /// `slots * 32 <= 0.7 * budget` (raised as needed to keep headroom
     /// over the vocab seed — budgets too small for the seed are floored,
@@ -1545,16 +1579,8 @@ impl Tokenizer {
                 ByteRemapping::remap_extend_any(self.byte_remapping.as_ref(), bytes, symbols);
                 bpe_merge_symbols_ranked(&rm, symbols);
             }
-            let len = symbols.len() as u32;
-            let offset = self.token_arena.len() as u32;
-            self.token_arena.extend_from_slice(symbols);
-            // Accounted here, enforced by the next miss's budget check.
-            if let Some(b) = &mut self.cache_budget {
-                b.long_bytes_used += bytes.len() + CacheBudget::LONG_ENTRY_BYTES;
-                b.max_encoding = b.max_encoding.max(len as usize);
-            }
-            self.pretoken_cache_long.insert(bytes.into(), (offset, len));
             out.extend_from_slice(token_ids_as_u32s(symbols));
+            self.cache_long_miss(bytes);
         }
     }
 
@@ -1662,6 +1688,22 @@ impl Tokenizer {
                     ),
                 }
             }
+            out.extend_from_slice(token_ids_as_u32s(symbols));
+            self.cache_long_miss(bytes);
+        }
+    }
+
+    /// Record a long-pretoken miss whose encoding is in `symbol_scratch`:
+    /// cache it in the long map unless it is too large for its budget
+    /// ([`CacheBudget::admits_long`]), then, with a budget set, give back
+    /// scratch a giant pretoken grew, which no sub-budget counts.
+    fn cache_long_miss(&mut self, bytes: &[u8]) {
+        let symbols = &self.symbol_scratch;
+        let admit = self
+            .cache_budget
+            .as_ref()
+            .is_none_or(|b| b.admits_long(bytes.len(), symbols.len()));
+        if admit {
             let len = symbols.len() as u32;
             let offset = self.token_arena.len() as u32;
             self.token_arena.extend_from_slice(symbols);
@@ -1671,7 +1713,10 @@ impl Tokenizer {
                 b.max_encoding = b.max_encoding.max(len as usize);
             }
             self.pretoken_cache_long.insert(bytes.into(), (offset, len));
-            out.extend_from_slice(token_ids_as_u32s(symbols));
+        }
+        if self.cache_budget.is_some() {
+            shrink_scratch(&mut self.symbol_scratch, SCRATCH_KEEP);
+            self.merge_scratch.shrink_to(SCRATCH_KEEP);
         }
     }
 
@@ -2310,10 +2355,10 @@ mod tests {
     }
 
     /// GIANT PRETOKEN: a recurring pretoken whose encoding alone exceeds
-    /// the arena sub-budget must not force a wipe per occurrence — the
-    /// arena trigger carries slack for the largest single encoding seen,
-    /// so the giant re-overflowing a freshly wiped arena cannot itself
-    /// re-trigger the wipe.
+    /// the arena sub-budget must not force a wipe per occurrence — it is
+    /// too large to be admitted to the cache, so it never fills the arena
+    /// (and an admitted large one is covered by the trigger's
+    /// `max_encoding` slack).
     #[test]
     fn budgeted_wipe_giant_pretoken_no_thrash() {
         let mut rng = test_util::XorShift64(0x61A7_0000_C0FF_EE00);
@@ -2352,6 +2397,52 @@ mod tests {
             (gens as usize) <= 2,
             "wipe per giant occurrence: {gens} wipes for {occurrences} occurrences"
         );
+    }
+
+    /// ADMISSION: a long pretoken too big for its share of a sub-budget
+    /// is encoded and served exactly but not cached, and the scratch it
+    /// grew is given back, so one giant input cannot hold a slot at
+    /// several times its cap until the next miss. A long pretoken within
+    /// the share is still cached.
+    #[test]
+    fn budgeted_giant_pretoken_is_served_uncached() {
+        for ranked in [false, true] {
+            let mut rng = test_util::XorShift64(0xAD31_7000_0000_0001);
+            let giant = random_words(&mut rng, 1, 1 << 20, b"abcdefgijklmnopqrstuvwxyz");
+            let medium = random_words(&mut rng, 1, 64, b"abcdefgijklmnopqrstuvwxyz");
+
+            let mut unbounded = budget_test_tokenizer(ranked);
+            unbounded.set_max_cache_bytes(None);
+            let mut tok = budget_test_tokenizer(ranked);
+            tok.set_max_cache_bytes(Some(4 << 20));
+            let (_, _, long_before, _, _, arena_before, _) = tok.cache_mem_stats();
+
+            // Twice: the second occurrence must miss and match again.
+            for _ in 0..2 {
+                let (mut want, mut got) = (Vec::new(), Vec::new());
+                unbounded.encode_with_added_tokens_flat(&giant, &mut want);
+                tok.encode_with_added_tokens_flat(&giant, &mut got);
+                assert_eq!(got, want, "ranked={ranked}");
+            }
+            let (_, _, long_len, _, _, arena_len, _) = tok.cache_mem_stats();
+            assert_eq!(
+                (long_len, arena_len),
+                (long_before, arena_before),
+                "the giant pretoken was cached (ranked={ranked})"
+            );
+            assert!(tok.symbol_scratch.capacity() <= SCRATCH_KEEP, "ranked={ranked}");
+            let m = &tok.merge_scratch;
+            assert!(
+                [m.next.capacity(), m.prev.capacity(), m.heap.capacity()]
+                    .iter()
+                    .all(|&c| c <= SCRATCH_KEEP),
+                "merge scratch kept (ranked={ranked})"
+            );
+
+            let mut out = Vec::new();
+            tok.encode_with_added_tokens_flat(&medium, &mut out);
+            assert_eq!(tok.cache_mem_stats().2, long_before + 1, "ranked={ranked}");
+        }
     }
 
     /// REDERIVE: loader-phase mutations after a budget is set must
