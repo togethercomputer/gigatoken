@@ -981,6 +981,15 @@ impl Tokenizer {
         self.pretoken_cache.len() + self.pretoken_cache_long.len()
     }
 
+    /// Generation wipes since the budget was set (or since this fork was
+    /// created); 0 when unbounded. Unlike [`Self::cache_entries`], it counts
+    /// every wipe, including one an encode refilled past its old size, so
+    /// comparing it across encodes tells a caller exactly how often the
+    /// budget binds (for sizing it).
+    pub fn cache_generations(&self) -> u64 {
+        self.cache_budget.as_ref().map_or(0, |b| b.generations)
+    }
+
     /// Re-derive the budget split after a loader-phase mutation that
     /// changes the seed footprint: a stale split could leave the grown
     /// seed with no post-wipe headroom (worst case, a wipe per miss).
@@ -2241,6 +2250,7 @@ mod tests {
             budgeted.encode_with_added_tokens_flat(&corpus, &mut actual);
 
             let gens = wipe_gens(&budgeted);
+            assert_eq!(budgeted.cache_generations(), gens);
             assert!(
                 gens >= 3,
                 "expected several wipes at a 4 MB budget, got {gens} (ranked={ranked})"
