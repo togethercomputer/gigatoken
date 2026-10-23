@@ -1,7 +1,7 @@
 use crate::bpe::pretoken_cache::ShortPretokenCache;
 use crate::bpe::{
     ByteRemapping, MergeScratch, MissingBytePolicy, PairRankTable, SHORT_MERGE_MAX,
-    bpe_merge_symbols_by_rank,
+    bpe_merge_symbols_by_rank, shrink_scratch,
     bpe_merge_symbols_ranked, bpe_merge_symbols_ranked_slice, bpe_merge_symbols_short_scalar,
     bpe_merge_symbols_with_scratch, simple_bpe_merge,
 };
@@ -111,8 +111,8 @@ struct CacheBudget {
     arena_entries: usize,
     /// Long-map byte budget (key bytes + [`Self::LONG_ENTRY_BYTES`] each).
     long_bytes: usize,
-    /// Long-map bytes this generation, maintained at the two long-map
-    /// insert sites; wipes reset it.
+    /// Long-map bytes this generation, maintained where
+    /// `Tokenizer::cache_long_miss` inserts; wipes reset it.
     long_bytes_used: usize,
     /// Largest single encoding (in tokens) appended to the arena, at most
     /// `arena_entries / LONG_ADMIT_DIVISOR` (a larger one is served
@@ -128,14 +128,6 @@ struct CacheBudget {
 /// Scratch capacity (in symbols) a budgeted tokenizer keeps between long
 /// misses; a pretoken that grew more gives the excess back.
 const SCRATCH_KEEP: usize = 1 << 16;
-
-/// Drop `v`'s contents and shrink it to `keep` when it holds more.
-fn shrink_scratch<T>(v: &mut Vec<T>, keep: usize) {
-    if v.capacity() > keep {
-        v.clear();
-        v.shrink_to(keep);
-    }
-}
 
 impl CacheBudget {
     /// Estimated non-key bytes per long-map entry (hashbrown bucket at

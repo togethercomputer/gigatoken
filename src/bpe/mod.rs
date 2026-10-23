@@ -407,19 +407,21 @@ pub struct MergeScratch {
     heap: Vec<std::cmp::Reverse<u64>>,
 }
 
+/// Drop a scratch buffer's contents and shrink it to `keep` elements when it
+/// holds more (after a giant pretoken grew it).
+pub(crate) fn shrink_scratch<T>(v: &mut Vec<T>, keep: usize) {
+    if v.capacity() > keep {
+        v.clear();
+        v.shrink_to(keep);
+    }
+}
+
 impl MergeScratch {
-    /// Drop the buffers' contents and shrink each to `keep` elements when
-    /// one holds more (after a giant pretoken grew them).
+    /// [`shrink_scratch`] each buffer.
     pub(crate) fn shrink_to(&mut self, keep: usize) {
-        fn shrink<T>(v: &mut Vec<T>, keep: usize) {
-            if v.capacity() > keep {
-                v.clear();
-                v.shrink_to(keep);
-            }
-        }
-        shrink(&mut self.next, keep);
-        shrink(&mut self.prev, keep);
-        shrink(&mut self.heap, keep);
+        shrink_scratch(&mut self.next, keep);
+        shrink_scratch(&mut self.prev, keep);
+        shrink_scratch(&mut self.heap, keep);
     }
 }
 
