@@ -649,6 +649,16 @@ fn detect_add_prefix_space(pre_tokenizer: &Option<PreTokenizerJson>) -> bool {
     pre_tokenizer.as_ref().is_some_and(walk)
 }
 
+/// Whether a `ByteLevel` pre-tokenizer appears anywhere in the chain (bare,
+/// or inside a `Sequence` after `Split`s, as Qwen and Hy3 export it): only
+/// then are the vocab strings GPT-2 byte-to-unicode encodings of bytes.
+fn has_byte_level_pretokenizer(pre_tokenizer: &Option<PreTokenizerJson>) -> bool {
+    fn walk(pt: &PreTokenizerJson) -> bool {
+        pt.kind == "ByteLevel" || pt.pretokenizers.iter().any(walk)
+    }
+    pre_tokenizer.as_ref().is_some_and(walk)
+}
+
 // ---------------------------------------------------------------------------
 // GPT-2 / ByteLevel BPE loader
 // ---------------------------------------------------------------------------
@@ -745,10 +755,18 @@ fn build_bpe(tj: &TokenizerJson) -> Result<bpe::tiktoken::Tokenizer> {
     // With no unk token, HF BPE drops unmapped symbols instead of erroring
     // (tencent/Hy3 ships no `\r` entry); with one, a byte-gap vocab would
     // need unk substitution (never seen on a byte-level BPE) — keep the
-    // load error for that combination.
-    let missing = match tj.model.unk_token {
-        None => bpe::MissingBytePolicy::Drop,
-        Some(_) => bpe::MissingBytePolicy::Error,
+    // load error for that combination. Dropping a missing BYTE is HF's
+    // behaviour only on a ByteLevel pipeline, where HF's symbols are bytes.
+    // Without one, HF's symbols are characters while `unicode_to_bytes`
+    // still reads the vocab through the GPT-2 table: a character-level
+    // `"ø": 128` becomes byte 0xF8, the input `ø` arrives as C3 B8, and
+    // dropping both bytes serves `[]` where HF serves `[128]`. Keep the load
+    // error there, so callers fall back to HF instead of serving different
+    // tokens.
+    let missing = if tj.model.unk_token.is_none() && has_byte_level_pretokenizer(&tj.pre_tokenizer) {
+        bpe::MissingBytePolicy::Drop
+    } else {
+        bpe::MissingBytePolicy::Error
     };
     let byte_remapping = bpe::ByteRemapping::from_byte_vocab(&vocab, missing)?;
     let vocab: Vec<Vec<u8>> = vocab.into_iter().map(|a| a.to_vec()).collect();
@@ -1027,6 +1045,58 @@ mod tests {
         assert_eq!(encode_bpe(&mut tok, "<m><m>"), vec![400, 400]);
         // lstrip trim happens before the prefix is applied.
         assert_eq!(encode_bpe(&mut tok, "x <m> y"), vec![32, 120, 400, 32, 121]);
+    }
+
+    /// A byte gap is dropped only on a ByteLevel pipeline. A character-level
+    /// BPE with `unk_token: null` and no ByteLevel pre-tokenizer must still
+    /// refuse to load: its vocab strings are characters, so dropping the
+    /// bytes of `ø` would serve `[]` where HF serves `[128]`.
+    #[test]
+    fn test_byte_gap_drop_requires_byte_level() {
+        let esc = |s: String| -> String { s.replace('\\', "\\\\").replace('"', "\\\"") };
+        let mut vocab_entries: Vec<String> = (0x20u8..0x7f)
+            .map(|b| format!("\"{}\": {}", esc((b as char).to_string()), b - 0x20))
+            .collect();
+        vocab_entries.push(r#""\n": 95"#.to_string());
+        vocab_entries.push(r#""\t": 96"#.to_string());
+        vocab_entries.push(r#""ø": 128"#.to_string());
+        let char_level = |pre_tokenizer: &str| {
+            format!(
+                "{{\"pre_tokenizer\": {pre_tokenizer}, \"model\": {{\"type\": \"BPE\", \
+                 \"unk_token\": null, \"vocab\": {{{}}}, \"merges\": []}}}}",
+                vocab_entries.join(", ")
+            )
+            .into_bytes()
+        };
+        // A known Split regex (GPT-2's), so the load gets past pretokenizer
+        // detection and fails on the byte gap alone.
+        let gpt2_split = format!(
+            r#"{{"type": "Split", "pattern": {{"Regex": "{}"}}, "behavior": "Isolated"}}"#,
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+                .replace('\\', "\\\\")
+        );
+        for pre_tokenizer in ["null", gpt2_split.as_str()] {
+            assert!(
+                load_hf_slice(&char_level(pre_tokenizer)).is_err(),
+                "a character-level vocab loaded with pre_tokenizer {pre_tokenizer}"
+            );
+        }
+
+        // A ByteLevel vocab missing `\r` (tencent/Hy3's shape) still loads
+        // and drops the byte, bare or inside a Sequence.
+        let (b2u, _) = build_byte_unicode_tables();
+        let sequence = format!(
+            r#"{{"type": "Sequence", "pretokenizers": [{gpt2_split}, {{"type": "ByteLevel", "use_regex": false}}]}}"#
+        );
+        for pre_tokenizer in [r#"{"type": "ByteLevel"}"#, sequence.as_str()] {
+            let json = byte_level_json_with_pretok(&[], &[], "", pre_tokenizer);
+            let cr = format!("\"{}\": 13", b2u[b'\r' as usize]);
+            let json = String::from_utf8(json).unwrap().replace(&cr, r#""unused_cr": 13"#);
+            let HfTokenizer::Bpe(mut tok) = load_hf_slice(json.as_bytes()).unwrap() else {
+                panic!("expected ByteLevel BPE");
+            };
+            assert_eq!(encode_bpe(&mut tok, "a\rb"), vec![97, 98], "{pre_tokenizer}");
+        }
     }
 
     #[test]
